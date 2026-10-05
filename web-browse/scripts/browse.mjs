@@ -1,0 +1,364 @@
+#!/usr/bin/env node
+/**
+ * browse.mjs — control headless Chrome over the CDP debug port (default 9222).
+ * Zero dependencies; requires Node >= 22 (global WebSocket) and system Chrome/Chromium.
+ *
+ * If nothing is listening on the port, the script launches its own headless Chrome,
+ * uses it, and kills it on exit (unless --keep). If a Chrome is already listening
+ * (e.g. one you started for debugging), it attaches to the first page tab.
+ */
+import { spawn, spawnSync } from 'node:child_process';
+import http from 'node:http';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+const USAGE = `Usage: node browse.mjs [options] <command> [args...]
+
+Commands:
+  text <url>                        print visible text (body.innerText)
+  html <url>                        print rendered DOM after JS runs
+  links <url>                       print deduplicated hrefs
+  eval <url> <js>                   evaluate JS in the page, print result
+  shot <url> [outfile]              full-page PNG (default /tmp/browse-<ts>.png)
+  pdf <url> [outfile]               print-to-PDF (default /tmp/browse-<ts>.pdf)
+  click <url> <selector>            navigate, wait, click element
+  type <url> <selector> <text>      navigate, wait, type into input/textarea
+
+Options:
+  --port <n>        CDP debug port (default 9222, or $CDP_PORT)
+  --settle <ms>     extra wait after page load (default 1500)
+  --timeout <ms>    selector wait timeout (default 20000)
+  --selector <css>  wait for this selector after load (any command)
+  --ua <string>     user agent (only when this script launches Chrome)
+  --window WxH      viewport (default 1280,1600; only when launching)
+  --no-sandbox      pass --no-sandbox to Chrome (auto-retry on launch failure)
+  --keep            don't kill the Chrome this script launched
+  --no-launch       attach to an existing Chrome on the port; never launch`;
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------- args ----------------
+const argv = process.argv.slice(2);
+const opts = {
+  port: parseInt(process.env.CDP_PORT || '9222', 10),
+  settle: 1500,
+  timeout: 20000,
+  selector: null,
+  ua: null,
+  window: '1280,1600',
+  noSandbox: false,
+  keep: false,
+  noLaunch: false,
+};
+const pos = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  switch (a) {
+    case '--port': opts.port = parseInt(argv[++i], 10); break;
+    case '--settle': opts.settle = parseInt(argv[++i], 10); break;
+    case '--timeout': opts.timeout = parseInt(argv[++i], 10); break;
+    case '--selector': opts.selector = argv[++i]; break;
+    case '--ua': opts.ua = argv[++i]; break;
+    case '--window': opts.window = argv[++i]; break;
+    case '--no-sandbox': opts.noSandbox = true; break;
+    case '--keep': opts.keep = true; break;
+    case '--no-launch': opts.noLaunch = true; break;
+    case '-h': case '--help': console.log(USAGE); process.exit(0); break;
+    default:
+      if (a.startsWith('--')) { console.error(`unknown option: ${a}`); process.exit(2); }
+      pos.push(a);
+  }
+}
+const [command, ...args] = pos;
+if (!command) { console.error(USAGE); process.exit(2); }
+
+const HOST = '127.0.0.1';
+
+// ---------------- CDP client ----------------
+class CDP {
+  constructor(ws) {
+    this.ws = ws;
+    this.id = 0;
+    this.pending = new Map();
+    this.handlers = [];
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString()); } catch { return; }
+      if (msg.id && this.pending.has(msg.id)) {
+        const { resolve, reject } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result);
+      } else if (msg.method) {
+        for (const h of this.handlers) h(msg);
+      }
+    };
+  }
+  static connect(wsUrl) {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      const timer = setTimeout(() => reject(new Error('websocket connect timeout')), 10000);
+      ws.onopen = () => { clearTimeout(timer); resolve(new CDP(ws)); };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error(`websocket error connecting to ${wsUrl}`)); };
+    });
+  }
+  send(method, params = {}) {
+    const id = ++this.id;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+      setTimeout(() => {
+        if (this.pending.has(id)) { this.pending.delete(id); reject(new Error(`CDP timeout: ${method}`)); }
+      }, 90000);
+    });
+  }
+  on(fn) { this.handlers.push(fn); }
+  close() { try { this.ws.close(); } catch {} }
+}
+
+// ---------------- HTTP helpers for the CDP endpoint ----------------
+function httpJson(p, method = 'GET') {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: HOST, port: opts.port, path: p, method }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode} for ${p}`));
+        try { resolve(JSON.parse(data)); } catch { reject(new Error(`bad JSON from ${p}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function portAlive() {
+  try { await httpJson('/json/version'); return true; } catch { return false; }
+}
+
+async function waitForPort(timeoutMs = 10000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (await portAlive()) return true;
+    await delay(250);
+  }
+  return false;
+}
+
+// ---------------- Chrome lifecycle ----------------
+function findChrome() {
+  for (const b of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
+    try { if (spawnSync(b, ['--version'], { stdio: 'ignore' }).status === 0) return b; } catch {}
+  }
+  return null;
+}
+
+function launchChrome(useNoSandbox) {
+  const bin = findChrome();
+  if (!bin) throw new Error('no Chrome/Chromium binary found (set CHROME_BIN or install Chrome)');
+  const profile = mkdtempSync(path.join(tmpdir(), 'cdp-profile-'));
+  const a = [
+    '--headless=new',
+    `--remote-debugging-port=${opts.port}`,
+    `--user-data-dir=${profile}`,
+    '--no-first-run', '--no-default-browser-check',
+    '--disable-gpu', '--disable-dev-shm-usage', '--disable-extensions',
+    `--window-size=${opts.window}`,
+    'about:blank',
+  ];
+  if (opts.ua) a.push(`--user-agent=${opts.ua}`);
+  if (useNoSandbox) a.push('--no-sandbox');
+  const proc = spawn(bin, a, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let err = '';
+  proc.stderr.on('data', (d) => (err += d.toString()));
+  return { proc, profile, bin, getErr: () => err };
+}
+
+async function acquireChrome() {
+  if (await portAlive()) {
+    console.error('[browse] attaching to existing Chrome on port ' + opts.port);
+    return null; // not ours to kill
+  }
+  if (opts.noLaunch) throw new Error(`nothing listening on port ${opts.port} (use --no-launch with an existing Chrome)`);
+  const tryLaunch = (noSandbox) =>
+    new Promise((resolve, reject) => {
+      const c = launchChrome(noSandbox);
+      c.proc.on('error', reject);
+      setTimeout(async () => {
+        if (await portAlive()) resolve(c);
+        else {
+          c.proc.kill('SIGKILL');
+          rmSync(c.profile, { recursive: true, force: true });
+          reject(new Error(`Chrome did not open debug port (stderr: ${c.getErr().slice(-300)})`));
+        }
+      }, 8000);
+      // fail fast if the process dies immediately
+      c.proc.on('exit', (code) => {
+        if (code !== null && code !== 0) {
+          rmSync(c.profile, { recursive: true, force: true });
+          reject(new Error(`Chrome exited early (code ${code}): ${c.getErr().slice(-300)}`));
+        }
+      });
+    });
+  try {
+    return await tryLaunch(opts.noSandbox);
+  } catch (e) {
+    if (!opts.noSandbox) {
+      console.error('[browse] retrying with --no-sandbox');
+      return await tryLaunch(true);
+    }
+    throw e;
+  }
+}
+
+function releaseChrome(chrome) {
+  if (!chrome) return;
+  if (opts.keep) { console.error('[browse] keeping Chrome alive (pid ' + chrome.proc.pid + ')'); return; }
+  try { chrome.proc.kill('SIGKILL'); } catch {}
+  rmSync(chrome.profile, { recursive: true, force: true });
+}
+
+// ---------------- page ops ----------------
+async function getPageTarget() {
+  const targets = await httpJson('/json');
+  const page = targets.find((t) => t.type === 'page');
+  if (page) return page;
+  // Chrome >= 111 requires PUT for /json/new
+  try { return await httpJson('/json/new?about:blank', 'PUT'); }
+  catch { return await httpJson('/json/new?about:blank', 'GET'); }
+}
+
+async function evalJs(cdp, expression, awaitPromise = false) {
+  const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise });
+  if (r.exceptionDetails) {
+    throw new Error('JS exception: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text || 'unknown'));
+  }
+  return r.result.value;
+}
+
+async function navigate(cdp, url) {
+  await cdp.send('Page.enable');
+  await cdp.send('Runtime.enable');
+  await cdp.send('Page.navigate', { url });
+  // poll readyState (robust even if loadEventFired was missed)
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000) {
+    const st = await evalJs(cdp, 'document.readyState').catch(() => 'loading');
+    if (st === 'complete') break;
+    await delay(200);
+  }
+  if (opts.settle > 0) await delay(opts.settle);
+  if (opts.selector) {
+    const t1 = Date.now();
+    while (Date.now() - t1 < opts.timeout) {
+      const found = await evalJs(cdp, `!!document.querySelector(${JSON.stringify(opts.selector)})`);
+      if (found) return;
+      await delay(250);
+    }
+    throw new Error(`selector not found within ${opts.timeout}ms: ${opts.selector}`);
+  }
+}
+
+function printValue(v) {
+  if (typeof v === 'string') process.stdout.write(v + '\n');
+  else process.stdout.write(JSON.stringify(v, null, 2) + '\n');
+}
+
+// ---------------- main ----------------
+const chrome = await acquireChrome();
+let exitCode = 0;
+try {
+  const target = await getPageTarget();
+  const cdp = await CDP.connect(target.webSocketDebuggerUrl);
+
+  switch (command) {
+    case 'text': {
+      if (!args[0]) throw new Error('text <url> required');
+      await navigate(cdp, args[0]);
+      printValue(await evalJs(cdp, 'document.body ? document.body.innerText : ""'));
+      break;
+    }
+    case 'html': {
+      if (!args[0]) throw new Error('html <url> required');
+      await navigate(cdp, args[0]);
+      printValue(await evalJs(cdp, 'document.documentElement.outerHTML'));
+      break;
+    }
+    case 'links': {
+      if (!args[0]) throw new Error('links <url> required');
+      await navigate(cdp, args[0]);
+      const links = await evalJs(cdp,
+        `[...document.querySelectorAll('a[href]')].map(a => a.href).filter(h => !h.startsWith('javascript:')).filter((v,i,s) => s.indexOf(v) === i)`);
+      for (const l of links) console.log(l);
+      break;
+    }
+    case 'eval': {
+      if (!args[0] || !args[1]) throw new Error('eval <url> <js-expression> required');
+      await navigate(cdp, args[0]);
+      printValue(await evalJs(cdp, args[1], true));
+      break;
+    }
+    case 'shot': {
+      if (!args[0]) throw new Error('shot <url> [outfile] required');
+      await navigate(cdp, args[0]);
+      const out = args[1] || `/tmp/browse-${Date.now()}.png`;
+      const r = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+      writeFileSync(out, Buffer.from(r.data, 'base64'));
+      console.log(out);
+      break;
+    }
+    case 'pdf': {
+      if (!args[0]) throw new Error('pdf <url> [outfile] required');
+      await navigate(cdp, args[0]);
+      const out = args[1] || `/tmp/browse-${Date.now()}.pdf`;
+      const r = await cdp.send('Page.printToPDF', { printBackground: true });
+      writeFileSync(out, Buffer.from(r.data, 'base64'));
+      console.log(out);
+      break;
+    }
+    case 'click': {
+      if (!args[0] || !args[1]) throw new Error('click <url> <selector> required');
+      await navigate(cdp, args[0]);
+      const res = await evalJs(cdp, `(() => {
+        const el = document.querySelector(${JSON.stringify(args[1])});
+        if (!el) return 'not-found';
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return 'clicked';
+      })()`);
+      if (res !== 'clicked') throw new Error(`click failed: ${res}`);
+      await delay(Math.max(opts.settle, 1500));
+      printValue({ clicked: args[1], url: await evalJs(cdp, 'location.href'), title: await evalJs(cdp, 'document.title') });
+      break;
+    }
+    case 'type': {
+      if (!args[0] || !args[1] || !args[2]) throw new Error('type <url> <selector> <text> required');
+      await navigate(cdp, args[0]);
+      const res = await evalJs(cdp, `(() => {
+        const el = document.querySelector(${JSON.stringify(args[1])});
+        if (!el) return 'not-found';
+        el.focus();
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (desc && desc.set) desc.set.call(el, ${JSON.stringify(args[2])});
+        else el.value = ${JSON.stringify(args[2])};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'typed';
+      })()`);
+      if (res !== 'typed') throw new Error(`type failed: ${res}`);
+      printValue({ typed: args[2], into: args[1] });
+      break;
+    }
+    default:
+      console.error(USAGE);
+      exitCode = 2;
+  }
+  cdp.close();
+} catch (e) {
+  console.error('error: ' + e.message);
+  exitCode = 1;
+} finally {
+  releaseChrome(chrome);
+}
+process.exit(exitCode);
