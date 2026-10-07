@@ -9,6 +9,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -136,6 +137,29 @@ async function portAlive() {
   try { await httpJson('/json/version'); return true; } catch { return false; }
 }
 
+// Is *anything* (CDP or not) accepting TCP connections on the port?
+function portListening() {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: HOST, port: opts.port });
+    const done = (v) => { try { s.destroy(); } catch {} resolve(v); };
+    s.on('connect', () => done(true));
+    s.on('error', () => done(false));
+    setTimeout(() => done(false), 1500);
+  });
+}
+
+// Find a free TCP port by briefly binding to port 0.
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, HOST, () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+    srv.on('error', reject);
+  });
+}
+
 async function waitForPort(timeoutMs = 10000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -147,6 +171,27 @@ async function waitForPort(timeoutMs = 10000) {
 
 // ---------------- Chrome lifecycle ----------------
 function findChrome() {
+  // 1. Explicit override wins.
+  if (process.env.CHROME_BIN) {
+    try { if (spawnSync(process.env.CHROME_BIN, ['--version'], { stdio: 'ignore' }).status === 0) return process.env.CHROME_BIN; } catch {}
+  }
+  // 2. Common install locations (macOS app bundles, Linux, Windows).
+  const candidates = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    process.env.HOME ? `${process.env.HOME}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` : null,
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ].filter(Boolean);
+  for (const b of candidates) {
+    try { if (spawnSync(b, ['--version'], { stdio: 'ignore' }).status === 0) return b; } catch {}
+  }
+  // 3. Fall back to PATH lookups.
   for (const b of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
     try { if (spawnSync(b, ['--version'], { stdio: 'ignore' }).status === 0) return b; } catch {}
   }
@@ -179,7 +224,14 @@ async function acquireChrome() {
     console.error('[browse] attaching to existing Chrome on port ' + opts.port);
     return null; // not ours to kill
   }
-  if (opts.noLaunch) throw new Error(`nothing listening on port ${opts.port} (use --no-launch with an existing Chrome)`);
+  if (opts.noLaunch) throw new Error(`no working CDP Chrome on port ${opts.port} (start one with --remote-debugging-port=${opts.port}, or drop --no-launch to let this script launch its own)`);
+  // Port is occupied by something that is NOT a working CDP endpoint. Launching
+  // on it would fail to bind, so pick a free port instead of erroring out.
+  if (await portListening()) {
+    const free = await findFreePort();
+    console.error(`[browse] port ${opts.port} is in use by a non-CDP process; launching on free port ${free} instead`);
+    opts.port = free;
+  }
   const tryLaunch = (noSandbox) =>
     new Promise((resolve, reject) => {
       const c = launchChrome(noSandbox);

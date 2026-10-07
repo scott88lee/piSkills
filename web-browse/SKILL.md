@@ -7,7 +7,7 @@ description: Render JavaScript-heavy web pages in headless Chrome and extract te
 
 Controls headless Chrome over the CDP debug port (default 9222). Zero dependencies: system Chrome/Chromium + Node >= 22.
 
-If nothing is listening on the port, the script launches its own headless Chrome, uses it, and kills it on exit. If a Chrome is already listening (e.g. one you started for debugging), it attaches to the first page tab — so you can also drive a browser you launched yourself with `--remote-debugging-port=9222`.
+If nothing is listening on the port, the script launches its own headless Chrome, uses it, and kills it on exit. If a working CDP Chrome is already listening (e.g. one you started for debugging), it attaches to the first page tab — so you can also drive a browser you launched yourself with `--remote-debugging-port=9222`. If the port is occupied by something that is *not* a CDP endpoint (a stale process, another app), the script automatically picks a free port and launches there instead of failing.
 
 ## Usage
 
