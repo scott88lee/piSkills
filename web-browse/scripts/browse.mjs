@@ -353,14 +353,21 @@ async function runServeOrStop(command) {
   if (command === 'stop') {
     const st = readState();
     const profile = st?.profile || opts.profile;
-    const out = spawnSync('pgrep', ['-f', `user-data-dir=${profile}`], { encoding: 'utf8' });
-    const pids = (out.stdout || '').trim().split('\n').filter(Boolean);
-    if (pids.length) {
-      for (const p of pids) { try { process.kill(parseInt(p, 10), 'SIGTERM'); } catch {} }
-      console.error(`[browse] stopped persistent Chrome (pids ${pids.join(', ')})`);
+    let stopped = [];
+    if (process.platform === 'win32') {
+      // No pgrep on Windows: kill the stored main PID and its whole process tree.
+      if (st?.pid) {
+        const r = spawnSync('taskkill', ['/PID', String(st.pid), '/T', '/F'], { stdio: 'ignore' });
+        if (r.status === 0) stopped = [`pid ${st.pid} + tree`];
+      }
     } else {
-      console.error('[browse] no persistent Chrome found for profile ' + profile);
+      // Unix (macOS/Linux): sweep every process tied to this profile dir (main + helpers).
+      const out = spawnSync('pgrep', ['-f', `user-data-dir=${profile}`], { encoding: 'utf8' });
+      const pids = (out.stdout || '').trim().split('\n').filter(Boolean);
+      for (const p of pids) { try { process.kill(parseInt(p, 10), 'SIGTERM'); stopped.push(p); } catch {} }
     }
+    if (stopped.length) console.error(`[browse] stopped persistent Chrome (${stopped.join(', ')})`);
+    else console.error('[browse] no persistent Chrome found for profile ' + profile);
     clearState();
     return;
   }
