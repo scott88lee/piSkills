@@ -10,8 +10,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 
 const USAGE = `Usage: node browse.mjs [options] <command> [args...]
@@ -25,9 +25,12 @@ Commands:
   pdf <url> [outfile]               print-to-PDF (default /tmp/browse-<ts>.pdf)
   click <url> <selector>            navigate, wait, click element
   type <url> <selector> <text>      navigate, wait, type into input/textarea
+  serve                   start a persistent VISIBLE Chrome (log in here); stays running
+  stop                    stop the persistent Chrome started by serve
 
 Options:
-  --port <n>        CDP debug port (default 9222, or $CDP_PORT)
+  --port <n>        CDP debug port (default 9222, or $CDP_PORT; serve defaults to 9333)
+  --profile <dir>   persistent profile dir for serve (default ~/.web-browse/chrome-profile)
   --settle <ms>     extra wait after page load (default 1500)
   --timeout <ms>    selector wait timeout (default 20000)
   --selector <css>  wait for this selector after load (any command)
@@ -41,8 +44,11 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------- args ----------------
 const argv = process.argv.slice(2);
+const envPortSet = !!process.env.CDP_PORT;
 const opts = {
   port: parseInt(process.env.CDP_PORT || '9222', 10),
+  portExplicit: false,
+  profile: path.join(homedir(), '.web-browse', 'chrome-profile'),
   settle: 1500,
   timeout: 20000,
   selector: null,
@@ -56,7 +62,8 @@ const pos = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   switch (a) {
-    case '--port': opts.port = parseInt(argv[++i], 10); break;
+    case '--port': opts.port = parseInt(argv[++i], 10); opts.portExplicit = true; break;
+    case '--profile': opts.profile = argv[++i]; break;
     case '--settle': opts.settle = parseInt(argv[++i], 10); break;
     case '--timeout': opts.timeout = parseInt(argv[++i], 10); break;
     case '--selector': opts.selector = argv[++i]; break;
@@ -158,6 +165,31 @@ function findFreePort() {
     });
     srv.on('error', reject);
   });
+}
+
+// Is a working CDP endpoint listening on a SPECIFIC port?
+function cdpAlive(port) {
+  return new Promise((resolve) => {
+    const req = http.request({ host: HOST, port, path: '/json/version', method: 'GET' }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => resolve(res.statusCode === 200));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1500, () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+// ---------------- persistent browser state ----------------
+const STATE_FILE = path.join(homedir(), '.web-browse', 'current.json');
+function readState() {
+  try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return null; }
+}
+function writeState(obj) {
+  try { mkdirSync(path.dirname(STATE_FILE), { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(obj, null, 2)); } catch {}
+}
+function clearState() {
+  try { rmSync(STATE_FILE, { force: true }); } catch {}
 }
 
 async function waitForPort(timeoutMs = 10000) {
@@ -316,7 +348,69 @@ function printValue(v) {
   else process.stdout.write(JSON.stringify(v, null, 2) + '\n');
 }
 
+// ---------------- persistent browser (serve/stop) ----------------
+async function runServeOrStop(command) {
+  if (command === 'stop') {
+    const st = readState();
+    const profile = st?.profile || opts.profile;
+    const out = spawnSync('pgrep', ['-f', `user-data-dir=${profile}`], { encoding: 'utf8' });
+    const pids = (out.stdout || '').trim().split('\n').filter(Boolean);
+    if (pids.length) {
+      for (const p of pids) { try { process.kill(parseInt(p, 10), 'SIGTERM'); } catch {} }
+      console.error(`[browse] stopped persistent Chrome (pids ${pids.join(', ')})`);
+    } else {
+      console.error('[browse] no persistent Chrome found for profile ' + profile);
+    }
+    clearState();
+    return;
+  }
+  // serve: launch a persistent, VISIBLE Chrome (no --headless) with a saved profile
+  const bin = findChrome();
+  if (!bin) throw new Error('no Chrome/Chromium binary found (set CHROME_BIN or install Chrome)');
+  const port = (opts.portExplicit || envPortSet) ? opts.port : 9333;
+  opts.port = port;
+  const profile = opts.profile;
+  mkdirSync(profile, { recursive: true });
+  if (await cdpAlive(port)) {
+    console.error(`[browse] a CDP Chrome is already running on port ${port}; leaving it as-is`);
+    writeState({ port, profile, pid: null, started: new Date().toISOString() });
+    return;
+  }
+  const a = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile}`,
+    '--no-first-run', '--no-default-browser-check',
+    `--window-size=${opts.window}`,
+    'about:blank',
+  ];
+  if (opts.ua) a.push(`--user-agent=${opts.ua}`);
+  const proc = spawn(bin, a, { detached: true, stdio: 'ignore' });
+  const pid = proc.pid;
+  proc.unref();
+  const ok = await waitForPort(15000);
+  if (!ok) throw new Error(`persistent Chrome did not open debug port ${port}`);
+  writeState({ port, profile, pid, started: new Date().toISOString() });
+  console.error(`[browse] persistent Chrome running (pid ${pid}) on port ${port}`);
+  console.error(`[browse] profile: ${profile}`);
+  console.error(`[browse] Log in to any site in that window. Other commands now auto-attach, e.g.:`);
+  console.error(`  node ${process.argv[1]} text <url>`);
+  console.error(`  node ${process.argv[1]} stop   # when you're done`);
+}
+
 // ---------------- main ----------------
+if (command === 'serve' || command === 'stop') {
+  try { await runServeOrStop(command); }
+  catch (e) { console.error('error: ' + e.message); process.exit(1); }
+  process.exit(0);
+}
+// If no explicit port was given and a persistent browser is running, attach to it.
+if (!opts.portExplicit && !envPortSet) {
+  const st = readState();
+  if (st && (await cdpAlive(st.port))) {
+    console.error(`[browse] attaching to persistent Chrome on port ${st.port}`);
+    opts.port = st.port;
+  }
+}
 const chrome = await acquireChrome();
 let exitCode = 0;
 try {

@@ -1,6 +1,6 @@
 ---
 name: web-browse
-description: Render JavaScript-heavy web pages in headless Chrome and extract text, HTML, links, screenshots, or PDFs; supports waiting for selectors, clicking, typing, and JS evaluation via the CDP debug port. Use when curl/fetch returns only a navigation shell or empty content (SPAs, client-side rendered sites), when a page needs JS to execute before content appears, when interactive steps (click, type) are needed, or when you need a screenshot of a page.
+description: Render JavaScript-heavy web pages in headless Chrome and extract text, HTML, links, screenshots, or PDFs; supports waiting for selectors, clicking, typing, and JS evaluation via the CDP debug port. Can also drive a persistent VISIBLE Chrome (serve) so sites that require login/auth work. Use when curl/fetch returns only a navigation shell or empty content (SPAs, client-side rendered sites), when a page needs JS to execute before content appears, when interactive steps (click, type) are needed, when a page is behind a login, or when you need a screenshot of a page.
 ---
 
 # Web browse
@@ -26,9 +26,12 @@ Commands:
 - `pdf <url> [outfile]` — print-to-PDF (default `/tmp/browse-<ts>.pdf`, path printed)
 - `click <url> <selector>` — navigate, wait, click element; prints resulting url/title
 - `type <url> <selector> <text>` — navigate, wait, type into input/textarea (fires React-compatible events)
+- `serve` — start a persistent, VISIBLE Chrome with a saved profile (default port 9333); it stays running so you can log in
+- `stop` — stop the persistent Chrome started by `serve`
 
 Options:
-- `--port <n>` CDP port (default 9222, or `$CDP_PORT`)
+- `--port <n>` CDP port (default 9222, or `$CDP_PORT`; `serve` defaults to 9333)
+- `--profile <dir>` persistent profile dir for `serve` (default `~/.web-browse/chrome-profile`)
 - `--settle <ms>` extra wait after load (default 1500; raise for slow pages)
 - `--timeout <ms>` selector wait timeout (default 20000)
 - `--selector <css>` wait for this selector after load, any command
@@ -44,7 +47,25 @@ Options:
 - If text looks empty or like a loading shell, retry with larger `--settle`, or use `--selector` to wait for a specific element (e.g. `--selector "article"`).
 - Prefer `--selector` over `--settle` when you know the element that marks content readiness.
 - `shot` is useful to see what the bot actually got when an anti-bot wall (e.g. Cloudflare challenge) blocks text extraction.
-- This is read-mostly: click/type work for simple flows, but there is no persistent session across invocations (fresh Chrome each run) and no login support. For complex interactive flows, prefer `eval` to drive the page's own JS, or use Playwright.
+- By default each run is a fresh, throwaway headless Chrome (no persistent session). For sites that need **login/auth**, use the persistent visible browser instead (see below).
+- For complex interactive flows, prefer `eval` to drive the page's own JS, or use Playwright.
+
+## Logging in / persistent browser (serve)
+
+The default headless mode is stateless — cookies and logins don't survive between runs. When a site requires authentication, start a persistent, **visible** Chrome with a saved profile, log in by hand in that window, and every later command reuses the session:
+
+```
+node scripts/browse.mjs serve        # opens a visible Chrome (port 9333, profile ~/.web-browse/chrome-profile)
+# ...log in to the site in that window...
+node scripts/browse.mjs text <url>   # auto-attaches to the persistent browser (no --port needed)
+node scripts/browse.mjs shot <url>   # same session, same cookies
+node scripts/browse.mjs stop         # close it when done
+```
+
+- `serve` launches Chrome **without** `--headless`, so you can see and interact with the window. It uses a dedicated profile, so it won't touch your normal browser.
+- While the persistent browser is running, any command without an explicit `--port` auto-attaches to it (detected via `~/.web-browse/current.json`). Pass `--port` to force a different browser, or `stop` first.
+- Login state persists in the profile across `stop`/`serve` cycles, so you typically only log in once.
+- The persistent browser drives its first page tab; keep the target site in that tab.
 
 ## Verify
 
