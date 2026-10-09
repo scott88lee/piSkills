@@ -8,7 +8,7 @@ Each top-level directory is one self-contained skill.
 
 | Skill | Description |
 | --- | --- |
-| [web-browse](./web-browse) | Render JS-heavy pages in headless Chrome (CDP) and extract text, HTML, links, screenshots, or PDFs; supports clicking, typing, and JS evaluation |
+| [web-browse](./web-browse) | Render JS-heavy pages in Chrome (headless or visible, CDP) and extract text, HTML, links, screenshots, or PDFs; supports clicking, typing, JS evaluation, and a persistent visible browser for human login; screenshots are viewable by the agent (multimodal) |
 
 ## Install
 

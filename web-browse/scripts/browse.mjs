@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * browse.mjs — control headless Chrome over the CDP debug port (default 9222).
+ * browse.mjs — control Chrome over the CDP debug port (default 9222).
  * Zero dependencies; requires Node >= 22 (global WebSocket) and system Chrome/Chromium.
  *
- * If nothing is listening on the port, the script launches its own headless Chrome,
- * uses it, and kills it on exit (unless --keep). If a Chrome is already listening
- * (e.g. one you started for debugging), it attaches to the first page tab.
+ * If nothing is listening on the port, the script launches its own Chrome (headless
+ * by default; --visible for a visible window), uses it, and kills it on exit
+ * (unless --keep). If a Chrome is already listening (e.g. one you started for
+ * debugging), it attaches to the first page tab.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
@@ -25,7 +26,8 @@ Commands:
   pdf <url> [outfile]               print-to-PDF (default /tmp/browse-<ts>.pdf)
   click <url> <selector>            navigate, wait, click element
   type <url> <selector> <text>      navigate, wait, type into input/textarea
-  serve                   start a persistent VISIBLE Chrome (log in here); stays running
+  serve                   start a persistent Chrome (visible by default; --headless
+                            to run without a window); log in here; stays running
   stop                    stop the persistent Chrome started by serve
 
 Options:
@@ -36,6 +38,9 @@ Options:
   --selector <css>  wait for this selector after load (any command)
   --ua <string>     user agent (only when this script launches Chrome)
   --window WxH      viewport (default 1280,1600; only when launching)
+  --visible         launch Chrome with a VISIBLE window (default: headless)
+  --headless        force headless (default for one-shot commands; overrides
+                    serve's default of a visible window)
   --no-sandbox      pass --no-sandbox to Chrome (auto-retry on launch failure)
   --keep            don't kill the Chrome this script launched
   --no-launch       attach to an existing Chrome on the port; never launch`;
@@ -54,6 +59,8 @@ const opts = {
   selector: null,
   ua: null,
   window: '1280,1600',
+  visible: false,
+  headless: false,
   noSandbox: false,
   keep: false,
   noLaunch: false,
@@ -69,6 +76,8 @@ for (let i = 0; i < argv.length; i++) {
     case '--selector': opts.selector = argv[++i]; break;
     case '--ua': opts.ua = argv[++i]; break;
     case '--window': opts.window = argv[++i]; break;
+    case '--visible': opts.visible = true; break;
+    case '--headless': opts.headless = true; break;
     case '--no-sandbox': opts.noSandbox = true; break;
     case '--keep': opts.keep = true; break;
     case '--no-launch': opts.noLaunch = true; break;
@@ -235,7 +244,7 @@ function launchChrome(useNoSandbox) {
   if (!bin) throw new Error('no Chrome/Chromium binary found (set CHROME_BIN or install Chrome)');
   const profile = mkdtempSync(path.join(tmpdir(), 'cdp-profile-'));
   const a = [
-    '--headless=new',
+    ...(!opts.visible ? ['--headless=new'] : []),
     `--remote-debugging-port=${opts.port}`,
     `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check',
@@ -371,7 +380,8 @@ async function runServeOrStop(command) {
     clearState();
     return;
   }
-  // serve: launch a persistent, VISIBLE Chrome (no --headless) with a saved profile
+  // serve: launch a persistent Chrome (visible by default; --headless to run
+  // without a window) with a saved profile
   const bin = findChrome();
   if (!bin) throw new Error('no Chrome/Chromium binary found (set CHROME_BIN or install Chrome)');
   const port = (opts.portExplicit || envPortSet) ? opts.port : 9333;
@@ -384,6 +394,7 @@ async function runServeOrStop(command) {
     return;
   }
   const a = [
+    ...(opts.headless ? ['--headless=new'] : []),
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check',
