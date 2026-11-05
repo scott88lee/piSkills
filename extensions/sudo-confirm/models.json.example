@@ -1,0 +1,17 @@
+{
+  "providers": {
+    "local": {
+      "baseUrl": "https://example.com/llama/v1",
+      "api": "openai-completions",
+      "apiKey": "none",
+      "models": [
+        {
+          "id": "my-model",
+          "input": ["text", "image"],
+          "contextWindow": 112740,
+          "maxTokens": 32768
+        }
+      ]
+    }
+  }
+}

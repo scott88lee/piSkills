@@ -1,0 +1,12 @@
+# Defensive: this repo documents pi configuration. Never commit a real one.
+# Examples use a .example suffix precisely so these stay ignored.
+models.json
+settings.json
+auth.json
+mcp.json
+*.bak
+sessions/
+
+# OS noise
+.DS_Store
+Thumbs.db
